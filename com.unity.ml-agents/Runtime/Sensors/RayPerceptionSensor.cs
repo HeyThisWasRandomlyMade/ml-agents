@@ -222,15 +222,20 @@ namespace Unity.MLAgents.Sensors
             /// <param name="numDetectableTags">Number of detectable tags</param>
             /// <param name="rayIndex">Ray index</param>
             /// <param name="buffer">Output buffer. The size must be equal to (numDetectableTags+2) * RayOutputs.Length</param>
-            public void ToFloatArray(int numDetectableTags, int rayIndex, float[] buffer)
+            public void ToFloatArray(int numTags, float[] buffer, int bufferIndex)
             {
-                var bufferOffset = (numDetectableTags + 2) * rayIndex;
-                if (HitTaggedObject)
+                // Observation 1: Inverted normalized distance (-1 if missed)
+                buffer[bufferIndex] = HasHit ? 1f - HitFraction : -1f;
+            
+                // Observation 2: Tag value between 0 and 1 (0 if no tag or unknown tag)
+                if (HasHit && HitTagIndex >= 0 && numTags > 0)
                 {
-                    buffer[bufferOffset + HitTagIndex] = 1f;
+                    buffer[bufferIndex + 1] = (HitTagIndex + 1) / (float)numTags;
                 }
-                buffer[bufferOffset + numDetectableTags] = HasHit ? 0f : 1f;
-                buffer[bufferOffset + numDetectableTags + 1] = HitFraction;
+                else
+                {
+                    buffer[bufferIndex + 1] = 0f; // No tag or unknown tag
+                }
             }
         }
 
