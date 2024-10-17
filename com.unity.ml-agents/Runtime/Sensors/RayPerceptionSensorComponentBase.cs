@@ -1,404 +1,620 @@
 using System;
 using System.Collections.Generic;
+using Unity.Collections;
+using Unity.Jobs;
 using UnityEngine;
-using UnityEngine.Serialization;
 
 namespace Unity.MLAgents.Sensors
 {
     /// <summary>
-    /// A base class to support sensor components for raycast-based sensors.
+    /// Determines which dimensions the sensor will perform the casts in.
     /// </summary>
-    public abstract class RayPerceptionSensorComponentBase : SensorComponent
+    public enum RayPerceptionCastType
     {
-        [HideInInspector, SerializeField, FormerlySerializedAs("sensorName")]
-        string m_SensorName = "RayPerceptionSensor";
+        /// <summary>
+        /// Cast in 2 dimensions, using Physics2D.CircleCast or Physics2D.RayCast.
+        /// </summary>
+        Cast2D,
 
         /// <summary>
-        /// The name of the Sensor that this component wraps.
-        /// Note that changing this at runtime does not affect how the Agent sorts the sensors.
+        /// Cast in 3 dimensions, using Physics.SphereCast or Physics.RayCast.
         /// </summary>
-        public string SensorName
-        {
-            get { return m_SensorName; }
-            set { m_SensorName = value; }
-        }
+        Cast3D,
+    }
 
-        [SerializeField, FormerlySerializedAs("detectableTags")]
-        [Tooltip("List of tags in the scene to compare against.")]
-        List<string> m_DetectableTags;
+    /// <summary>
+    /// Contains the elements that define a ray perception sensor.
+    /// </summary>
+    public struct RayPerceptionInput
+    {
+        /// <summary>
+        /// Length of the rays to cast. This will be scaled up or down based on the scale of the transform.
+        /// </summary>
+        public float RayLength;
 
         /// <summary>
-        /// List of tags in the scene to compare against.
-        /// Note that this should not be changed at runtime.
+        /// List of tags which correspond to object types agent can see.
         /// </summary>
-        public List<string> DetectableTags
-        {
-            get { return m_DetectableTags; }
-            set { m_DetectableTags = value; }
-        }
-
-        [HideInInspector, SerializeField, FormerlySerializedAs("raysPerDirection")]
-        [Range(0, 50)]
-        [Tooltip("Number of rays to the left and right of center.")]
-        int m_RaysPerDirection = 3;
+        public IReadOnlyList<string> DetectableTags;
 
         /// <summary>
-        /// Number of rays to the left and right of center.
-        /// Note that this should not be changed at runtime.
+        /// List of angles (in degrees) used to define the rays.
+        /// 90 degrees is considered "forward" relative to the game object.
         /// </summary>
-        public int RaysPerDirection
-        {
-            get { return m_RaysPerDirection; }
-            // Note: can't change at runtime
-            set { m_RaysPerDirection = value; }
-        }
-
-        [HideInInspector, SerializeField, FormerlySerializedAs("maxRayDegrees")]
-        [Range(0, 180)]
-        [Tooltip("Cone size for rays. Using 90 degrees will cast rays to the left and right. " +
-            "Greater than 90 degrees will go backwards.")]
-        float m_MaxRayDegrees = 70;
+        public IReadOnlyList<float> Angles;
 
         /// <summary>
-        /// Cone size for rays. Using 90 degrees will cast rays to the left and right.
-        /// Greater than 90 degrees will go backwards.
+        /// Starting height offset of ray from center of agent
         /// </summary>
-        public float MaxRayDegrees
-        {
-            get => m_MaxRayDegrees;
-            set { m_MaxRayDegrees = value; UpdateSensor(); }
-        }
-
-        [HideInInspector, SerializeField, FormerlySerializedAs("sphereCastRadius")]
-        [Range(0f, 10f)]
-        [Tooltip("Radius of sphere to cast. Set to zero for raycasts.")]
-        float m_SphereCastRadius = 0.5f;
+        public float StartOffset;
 
         /// <summary>
-        /// Radius of sphere to cast. Set to zero for raycasts.
+        /// Ending height offset of ray from center of agent.
         /// </summary>
-        public float SphereCastRadius
-        {
-            get => m_SphereCastRadius;
-            set { m_SphereCastRadius = value; UpdateSensor(); }
-        }
-
-        [HideInInspector, SerializeField, FormerlySerializedAs("rayLength")]
-        [Range(1, 1000)]
-        [Tooltip("Length of the rays to cast.")]
-        float m_RayLength = 20f;
+        public float EndOffset;
 
         /// <summary>
-        /// Length of the rays to cast.
+        /// Radius of the sphere to use for spherecasting.
+        /// If 0 or less, rays are used instead - this may be faster, especially for complex environments.
         /// </summary>
-        public float RayLength
-        {
-            get => m_RayLength;
-            set { m_RayLength = value; UpdateSensor(); }
-        }
-
-        // The value of the default layers.
-        const int k_PhysicsDefaultLayers = -5;
-        [HideInInspector, SerializeField, FormerlySerializedAs("rayLayerMask")]
-        [Tooltip("Controls which layers the rays can hit.")]
-        LayerMask m_RayLayerMask = k_PhysicsDefaultLayers;
+        public float CastRadius;
 
         /// <summary>
-        /// Controls which layers the rays can hit.
+        /// Transform of the GameObject.
         /// </summary>
-        public LayerMask RayLayerMask
-        {
-            get => m_RayLayerMask;
-            set { m_RayLayerMask = value; UpdateSensor(); }
-        }
-
-        [HideInInspector, SerializeField, FormerlySerializedAs("observationStacks")]
-        [Range(1, 50)]
-        [Tooltip("Number of raycast results that will be stacked before being fed to the neural network.")]
-        int m_ObservationStacks = 1;
+        public Transform Transform;
 
         /// <summary>
-        /// Whether to stack previous observations. Using 1 means no previous observations.
-        /// Note that changing this after the sensor is created has no effect.
+        /// Whether to perform the casts in 2D or 3D.
         /// </summary>
-        public int ObservationStacks
+        public RayPerceptionCastType CastType;
+
+        /// <summary>
+        /// Filtering options for the casts.
+        /// </summary>
+        public int LayerMask;
+
+        /// <summary>
+        ///  Whether to use batched raycasts.
+        /// </summary>
+        public bool UseBatchedRaycasts;
+
+        /// <summary>
+        /// Returns the expected number of floats in the output.
+        /// </summary>
+        /// <returns>The expected number of floats in the output.</returns>
+        public int OutputSize()
         {
-            get { return m_ObservationStacks; }
-            set { m_ObservationStacks = value; }
+            // Modified output size: 2 observations per ray
+            return 2 * (Angles?.Count ?? 0);
         }
 
         /// <summary>
-        /// Disable to provide the rays in left to right order
+        /// Get the cast start and end points for the given ray index/
         /// </summary>
-        [HideInInspector, SerializeField]
-        [Tooltip("Disable to provide the rays in left to right order.  Warning: Alternating order will be deprecated, disable it to ensure compatibility with future versions of ML-Agents.")]
-        public bool m_AlternatingRayOrder = true;
-
-        /// <summary>
-        /// Determines how the rays are ordered.  By default the ordering is as follows: middle ray is first;
-        /// then alternates outward adding rays to the left and right.  If set to false, then the rays are
-        /// ordered from left to right (viewed from above) which is more amenable to processing with
-        /// conv nets.
-        /// This property will be deprecated with the next major version update and the left to right ordering
-        /// will be used thereafter.
-        /// </summary>
-        public bool AlternatingRayOrder
+        /// <param name="rayIndex">Ray index</param>
+        /// <returns>A tuple of the start and end positions in world space.</returns>
+        public (Vector3 StartPositionWorld, Vector3 EndPositionWorld) RayExtents(int rayIndex)
         {
-            get { return m_AlternatingRayOrder; }
-            set { m_AlternatingRayOrder = value; }
-        }
-
-        /// <summary>
-        /// Determines whether to use batched raycasts and the jobs system. Default = false.
-        /// </summary>
-        [HideInInspector, SerializeField]
-        [Tooltip("Enable to use batched raycasts and the jobs system.")]
-        public bool m_UseBatchedRaycasts = false;
-
-        /// <summary>
-        /// Determines whether to use batched raycasts and the jobs system. Default = false.
-        /// </summary>
-        public bool UseBatchedRaycasts
-        {
-            get { return m_UseBatchedRaycasts; }
-            set { m_UseBatchedRaycasts = value; }
-        }
-
-
-        /// <summary>
-        /// Color to code a ray that hits another object.
-        /// </summary>
-        [HideInInspector]
-        [SerializeField]
-        [Header("Debug Gizmos", order = 999)]
-        internal Color rayHitColor = Color.red;
-
-        /// <summary>
-        /// Color to code a ray that avoid or misses all other objects.
-        /// </summary>
-        [HideInInspector]
-        [SerializeField]
-        internal Color rayMissColor = Color.white;
-
-        [NonSerialized]
-        RayPerceptionSensor m_RaySensor;
-
-        /// <summary>
-        /// Get the RayPerceptionSensor that was created.
-        /// </summary>
-        public RayPerceptionSensor RaySensor
-        {
-            get => m_RaySensor;
-        }
-
-        /// <summary>
-        /// Returns the <see cref="RayPerceptionCastType"/> for the associated raycast sensor.
-        /// </summary>
-        /// <returns>`RayPerceptionCastType` for the associated raycast sensor.</returns>
-        public abstract RayPerceptionCastType GetCastType();
-
-        /// <summary>
-        /// Returns the amount that the ray start is offset up or down by.
-        /// </summary>
-        /// <returns>The amount that the ray start is offset up or down by.</returns>
-        public virtual float GetStartVerticalOffset()
-        {
-            return 0f;
-        }
-
-        /// <summary>
-        /// Returns the amount that the ray end is offset up or down by.
-        /// </summary>
-        /// <returns>The amount that the ray end is offset up or down by.</returns>
-        public virtual float GetEndVerticalOffset()
-        {
-            return 0f;
-        }
-
-        /// <summary>
-        /// Returns an initialized raycast sensor.
-        /// </summary>
-        /// <returns>Initialized `ISensor` array.</returns>
-        public override ISensor[] CreateSensors()
-        {
-            var rayPerceptionInput = GetRayPerceptionInput();
-
-            m_RaySensor = new RayPerceptionSensor(m_SensorName, rayPerceptionInput);
-
-            if (ObservationStacks != 1)
+            var angle = Angles[rayIndex];
+            Vector3 startPositionLocal, endPositionLocal;
+            if (CastType == RayPerceptionCastType.Cast3D)
             {
-                var stackingSensor = new StackingSensor(m_RaySensor, ObservationStacks);
-                return new ISensor[] { stackingSensor };
-            }
-
-            return new ISensor[] { m_RaySensor };
-        }
-
-        /// <summary>
-        /// Returns the specific ray angles given the number of rays per direction and the
-        /// cone size for the rays.
-        /// </summary>
-        /// <param name="raysPerDirection">Number of rays to the left and right of center.</param>
-        /// <param name="maxRayDegrees">
-        /// Cone size for rays. Using 90 degrees will cast rays to the left and right.
-        /// Greater than 90 degrees will go backwards.
-        /// Orders the rays starting with the centermost and alternating to the left and right.
-        /// Should be deprecated with a future major version release (doing so will break existing
-        /// models).
-        /// </param>
-        /// <returns>The corresponding ray angles.</returns>
-        internal static float[] GetRayAnglesAlternating(int raysPerDirection, float maxRayDegrees)
-        {
-            // Example:
-            // { 90, 90 - delta, 90 + delta, 90 - 2*delta, 90 + 2*delta }
-            var anglesOut = new float[2 * raysPerDirection + 1];
-            var delta = maxRayDegrees / raysPerDirection;
-            anglesOut[0] = 90f;
-            for (var i = 0; i < raysPerDirection; i++)
-            {
-                anglesOut[2 * i + 1] = 90 - (i + 1) * delta;
-                anglesOut[2 * i + 2] = 90 + (i + 1) * delta;
-            }
-            return anglesOut;
-        }
-
-        /// <summary>
-        /// Returns the specific ray angles given the number of rays per direction and the
-        /// cone size for the rays.
-        /// </summary>
-        /// <param name="raysPerDirection">Number of rays to the left and right of center.</param>
-        /// <param name="maxRayDegrees">
-        /// Cone size for rays. Using 90 degrees will cast rays to the left and right.
-        /// Greater than 90 degrees will go backwards.
-        /// Orders the rays from the left-most to the right-most which makes using a convolution
-        /// in the model easier.
-        /// </param>
-        /// <returns>The corresponding ray angles.</returns>
-        internal static float[] GetRayAngles(int raysPerDirection, float maxRayDegrees)
-        {
-            // Example:
-            // { 90 - 3*delta, 90 - 2*delta, ..., 90, 90 + delta, ..., 90 + 3*delta }
-            var anglesOut = new float[2 * raysPerDirection + 1];
-            var delta = maxRayDegrees / raysPerDirection;
-
-            for (var i = 0; i < 2 * raysPerDirection + 1; i++)
-            {
-                anglesOut[i] = 90 + (i - raysPerDirection) * delta;
-            }
-
-            return anglesOut;
-        }
-
-        /// <summary>
-        /// Get the RayPerceptionInput that is used by the <see cref="RayPerceptionSensor"/>.
-        /// </summary>
-        /// <returns>`RayPerceptionInput` that is used by the sensor.</returns>
-        public RayPerceptionInput GetRayPerceptionInput()
-        {
-            var rayAngles = m_AlternatingRayOrder ?
-                GetRayAnglesAlternating(RaysPerDirection, MaxRayDegrees) :
-                GetRayAngles(RaysPerDirection, MaxRayDegrees);
-
-            var rayPerceptionInput = new RayPerceptionInput();
-            rayPerceptionInput.RayLength = RayLength;
-            rayPerceptionInput.DetectableTags = DetectableTags;
-            rayPerceptionInput.Angles = rayAngles;
-            rayPerceptionInput.StartOffset = GetStartVerticalOffset();
-            rayPerceptionInput.EndOffset = GetEndVerticalOffset();
-            rayPerceptionInput.CastRadius = SphereCastRadius;
-            rayPerceptionInput.Transform = transform;
-            rayPerceptionInput.CastType = GetCastType();
-            rayPerceptionInput.LayerMask = RayLayerMask;
-            rayPerceptionInput.UseBatchedRaycasts = UseBatchedRaycasts;
-
-            return rayPerceptionInput;
-        }
-
-        internal void UpdateSensor()
-        {
-            if (m_RaySensor != null)
-            {
-                var rayInput = GetRayPerceptionInput();
-                m_RaySensor.SetRayPerceptionInput(rayInput);
-            }
-        }
-
-        internal int SensorObservationAge()
-        {
-            if (m_RaySensor != null)
-            {
-                return Time.frameCount - m_RaySensor.DebugLastFrameCount;
-            }
-
-            return 0;
-        }
-
-        void OnDrawGizmosSelected()
-        {
-            if (m_RaySensor?.RayPerceptionOutput?.RayOutputs != null)
-            {
-                // If we have cached debug info from the sensor, draw that.
-                // Draw "old" observations in a lighter color.
-                // Since the agent may not step every frame, this helps de-emphasize "stale" hit information.
-                var alpha = Mathf.Pow(.5f, SensorObservationAge());
-
-                foreach (var rayInfo in m_RaySensor.RayPerceptionOutput.RayOutputs)
-                {
-                    DrawRaycastGizmos(rayInfo, alpha);
-                }
+                startPositionLocal = new Vector3(0, StartOffset, 0);
+                endPositionLocal = PolarToCartesian3D(RayLength, angle);
+                endPositionLocal.y += EndOffset;
             }
             else
             {
-                var rayInput = GetRayPerceptionInput();
-                // We don't actually need the tags here, since they don't affect the display of the rays.
-                // Additionally, the user might be in the middle of typing the tag name when this is called,
-                // and there's no way to turn off the "Tag ... is not defined" error logs.
-                // So just don't use any tags here.
-                rayInput.DetectableTags = null;
-                if (m_UseBatchedRaycasts && rayInput.CastType == RayPerceptionCastType.Cast3D)
+                // Vector2s here get converted to Vector3s (and back to Vector2s for casting)
+                startPositionLocal = new Vector2();
+                endPositionLocal = PolarToCartesian2D(RayLength, angle);
+            }
+
+            var startPositionWorld = Transform.TransformPoint(startPositionLocal);
+            var endPositionWorld = Transform.TransformPoint(endPositionLocal);
+
+            return (StartPositionWorld: startPositionWorld, EndPositionWorld: endPositionWorld);
+        }
+
+        /// <summary>
+        /// Converts polar coordinate to cartesian coordinate.
+        /// </summary>
+        static internal Vector3 PolarToCartesian3D(float radius, float angleDegrees)
+        {
+            var x = radius * Mathf.Cos(Mathf.Deg2Rad * angleDegrees);
+            var z = radius * Mathf.Sin(Mathf.Deg2Rad * angleDegrees);
+            return new Vector3(x, 0f, z);
+        }
+
+        /// <summary>
+        /// Converts polar coordinate to cartesian coordinate.
+        /// </summary>
+        static internal Vector2 PolarToCartesian2D(float radius, float angleDegrees)
+        {
+            var x = radius * Mathf.Cos(Mathf.Deg2Rad * angleDegrees);
+            var y = radius * Mathf.Sin(Mathf.Deg2Rad * angleDegrees);
+            return new Vector2(x, y);
+        }
+    }
+
+    /// <summary>
+    /// Contains the data generated/produced from a ray perception sensor.
+    /// </summary>
+    public class RayPerceptionOutput
+    {
+        /// <summary>
+        /// Contains the data generated from a single ray of a ray perception sensor.
+        /// </summary>
+        public struct RayOutput
+        {
+            /// <summary>
+            /// Whether or not the ray hit anything.
+            /// </summary>
+            public bool HasHit;
+
+            /// <summary>
+            /// The index of the hit object's tag in the DetectableTags list, or -1 if there was no hit, or the
+            /// hit object has a different tag.
+            /// </summary>
+            public int HitTagIndex;
+
+            /// <summary>
+            /// Normalized distance to the hit object.
+            /// </summary>
+            public float HitFraction;
+
+            /// <summary>
+            /// The hit GameObject (or null if there was no hit).
+            /// </summary>
+            public GameObject HitGameObject;
+
+            /// <summary>
+            /// Start position of the ray in world space.
+            /// </summary>
+            public Vector3 StartPositionWorld;
+
+            /// <summary>
+            /// End position of the ray in world space.
+            /// </summary>
+            public Vector3 EndPositionWorld;
+
+            /// <summary>
+            /// The scaled length of the ray.
+            /// </summary>
+            /// <remarks>
+            /// If there is non-(1,1,1) scale, |EndPositionWorld - StartPositionWorld| will be different from
+            /// the input rayLength.
+            /// </remarks>
+            public float ScaledRayLength
+            {
+                get
                 {
-                    // TODO add call to PerceiveBatchedRays()
-                    var rayOutputs = new RayPerceptionOutput.RayOutput[rayInput.Angles.Count];
-                    RayPerceptionSensor.PerceiveBatchedRays(ref rayOutputs, rayInput);
-                    for (var rayIndex = 0; rayIndex < rayInput.Angles.Count; rayIndex++)
-                    {
-                        DrawRaycastGizmos(rayOutputs[rayIndex]);
-                    }
+                    var rayDirection = EndPositionWorld - StartPositionWorld;
+                    return rayDirection.magnitude;
+                }
+            }
+
+            /// <summary>
+            /// The scaled size of the cast.
+            /// </summary>
+            /// <remarks>
+            /// If there is non-(1,1,1) scale, the cast radius will be also be scaled.
+            /// </remarks>
+            public float ScaledCastRadius;
+
+            /// <summary>
+            /// Writes the ray output information to a subset of the float array.
+            /// </summary>
+            /// <param name="numTags">Number of detectable tags</param>
+            /// <param name="buffer">Output buffer</param>
+            /// <param name="bufferIndex">Start index in the buffer</param>
+            public void ToFloatArray(int numTags, float[] buffer, int bufferIndex)
+            {
+                // Observation 1: Normalized distance (-1 if missed)
+                buffer[bufferIndex] = HasHit ? HitFraction : -1f;
+
+                // Observation 2: Tag value between 0 and 1 (0 if no tag or unknown tag)
+                if (HasHit && HitTagIndex >= 0 && numTags > 0)
+                {
+                    buffer[bufferIndex + 1] = (HitTagIndex + 1) / (float)numTags;
                 }
                 else
                 {
-                    for (var rayIndex = 0; rayIndex < rayInput.Angles.Count; rayIndex++)
-                    {
-                        var rayOutput = RayPerceptionSensor.PerceiveSingleRay(rayInput, rayIndex);
-                        DrawRaycastGizmos(rayOutput);
-                    }
+                    buffer[bufferIndex + 1] = 0f; // No tag or unknown tag
                 }
             }
         }
 
         /// <summary>
-        /// Draw the debug information from the sensor (if available).
+        /// RayOutput for each ray that was cast.
         /// </summary>
-        void DrawRaycastGizmos(RayPerceptionOutput.RayOutput rayOutput, float alpha = 1.0f)
+        public RayOutput[] RayOutputs;
+    }
+
+    /// <summary>
+    /// A sensor implementation that supports ray cast-based observations.
+    /// </summary>
+    public class RayPerceptionSensor : ISensor, IBuiltInSensor
+    {
+        float[] m_Observations;
+        ObservationSpec m_ObservationSpec;
+        string m_Name;
+
+        RayPerceptionInput m_RayPerceptionInput;
+        RayPerceptionOutput m_RayPerceptionOutput;
+
+        bool m_UseBatchedRaycasts;
+
+        /// <summary>
+        /// Time.frameCount at the last time Update() was called. This is only used for display in gizmos.
+        /// </summary>
+        int m_DebugLastFrameCount;
+
+        internal int DebugLastFrameCount
         {
-            var startPositionWorld = rayOutput.StartPositionWorld;
-            var endPositionWorld = rayOutput.EndPositionWorld;
-            var rayDirection = endPositionWorld - startPositionWorld;
-            rayDirection *= rayOutput.HitFraction;
+            get { return m_DebugLastFrameCount; }
+        }
 
-            // hit fraction ^2 will shift "far" hits closer to the hit color
-            var lerpT = rayOutput.HitFraction * rayOutput.HitFraction;
-            var color = Color.Lerp(rayHitColor, rayMissColor, lerpT);
-            color.a *= alpha;
-            Gizmos.color = color;
-            Gizmos.DrawRay(startPositionWorld, rayDirection);
+        /// <summary>
+        /// Creates the RayPerceptionSensor.
+        /// </summary>
+        /// <param name="name">The name of the sensor.</param>
+        /// <param name="rayInput">The inputs for the sensor.</param>
+        public RayPerceptionSensor(string name, RayPerceptionInput rayInput)
+        {
+            m_Name = name;
+            m_RayPerceptionInput = rayInput;
+            m_UseBatchedRaycasts = rayInput.UseBatchedRaycasts;
 
-            // Draw the hit point as a sphere. If using rays to cast (0 radius), use a small sphere.
-            if (rayOutput.HasHit)
+            SetNumObservations(rayInput.OutputSize());
+
+            m_DebugLastFrameCount = Time.frameCount;
+            m_RayPerceptionOutput = new RayPerceptionOutput();
+        }
+
+        /// <summary>
+        /// The most recent raycast results.
+        /// </summary>
+        public RayPerceptionOutput RayPerceptionOutput
+        {
+            get { return m_RayPerceptionOutput; }
+        }
+
+        void SetNumObservations(int numObservations)
+        {
+            m_ObservationSpec = ObservationSpec.Vector(numObservations);
+            m_Observations = new float[numObservations];
+        }
+
+        internal void SetRayPerceptionInput(RayPerceptionInput rayInput)
+        {
+            if (m_RayPerceptionInput.OutputSize() != rayInput.OutputSize())
             {
-                var hitRadius = Mathf.Max(rayOutput.ScaledCastRadius, .05f);
-                Gizmos.DrawWireSphere(startPositionWorld + rayDirection, hitRadius);
+                Debug.Log(
+                    "Changing the number of tags or rays at runtime is not " +
+                    "supported and may cause errors in training or inference."
+                );
+                SetNumObservations(rayInput.OutputSize());
             }
+            m_RayPerceptionInput = rayInput;
+        }
+
+        /// <summary>
+        /// Computes the ray perception observations and saves them to the provided
+        /// <see cref="ObservationWriter"/>.
+        /// </summary>
+        /// <param name="writer">Where the ray perception observations are written to.</param>
+        /// <returns>The number of written observations.</returns>
+        public int Write(ObservationWriter writer)
+        {
+            Array.Clear(m_Observations, 0, m_Observations.Length);
+            int numRays = m_RayPerceptionInput.Angles.Count;
+            int numTags = m_RayPerceptionInput.DetectableTags?.Count ?? 0;
+
+            for (int rayIndex = 0; rayIndex < numRays; rayIndex++)
+            {
+                int bufferIndex = rayIndex * 2;
+                m_RayPerceptionOutput.RayOutputs[rayIndex].ToFloatArray(numTags, m_Observations, bufferIndex);
+            }
+
+            writer.AddList(m_Observations);
+            return m_Observations.Length;
+        }
+
+        /// <inheritdoc/>
+        public void Update()
+        {
+            m_DebugLastFrameCount = Time.frameCount;
+            var numRays = m_RayPerceptionInput.Angles.Count;
+
+            if (m_RayPerceptionOutput.RayOutputs == null || m_RayPerceptionOutput.RayOutputs.Length != numRays)
+            {
+                m_RayPerceptionOutput.RayOutputs = new RayPerceptionOutput.RayOutput[numRays];
+            }
+
+            if (m_UseBatchedRaycasts && m_RayPerceptionInput.CastType == RayPerceptionCastType.Cast3D)
+            {
+                PerceiveBatchedRays(ref m_RayPerceptionOutput.RayOutputs, m_RayPerceptionInput);
+            }
+            else
+            {
+                // For each ray, do the casting and save the results.
+                for (var rayIndex = 0; rayIndex < numRays; rayIndex++)
+                {
+                    m_RayPerceptionOutput.RayOutputs[rayIndex] = PerceiveSingleRay(m_RayPerceptionInput, rayIndex);
+                }
+            }
+        }
+
+        /// <inheritdoc/>
+        public void Reset() { }
+
+        /// <inheritdoc/>
+        public ObservationSpec GetObservationSpec()
+        {
+            return m_ObservationSpec;
+        }
+
+        /// <inheritdoc/>
+        public string GetName()
+        {
+            return m_Name;
+        }
+
+        /// <inheritdoc/>
+        public virtual byte[] GetCompressedObservation()
+        {
+            return null;
+        }
+
+        /// <inheritdoc/>
+        public CompressionSpec GetCompressionSpec()
+        {
+            return CompressionSpec.Default();
+        }
+
+        /// <inheritdoc/>
+        public BuiltInSensorType GetBuiltInSensorType()
+        {
+            return BuiltInSensorType.RayPerceptionSensor;
+        }
+
+        /// <summary>
+        /// Evaluates the raycasts to be used as part of an observation of an agent.
+        /// </summary>
+        /// <param name="input">Input defining the rays that will be cast.</param>
+        /// <param name="batched">Use batched raycasts.</param>
+        /// <returns>Output struct containing the raycast results.</returns>
+        public static RayPerceptionOutput Perceive(RayPerceptionInput input, bool batched)
+        {
+            RayPerceptionOutput output = new RayPerceptionOutput();
+            output.RayOutputs = new RayPerceptionOutput.RayOutput[input.Angles.Count];
+
+            if (batched)
+            {
+                PerceiveBatchedRays(ref output.RayOutputs, input);
+            }
+            else
+            {
+                for (var rayIndex = 0; rayIndex < input.Angles.Count; rayIndex++)
+                {
+                    output.RayOutputs[rayIndex] = PerceiveSingleRay(input, rayIndex);
+                }
+            }
+
+            return output;
+        }
+
+        /// <summary>
+        /// Evaluate the raycast results of all the rays from the RayPerceptionInput as a batch.
+        /// </summary>
+        /// <param name="input">Input</param>
+        internal static void PerceiveBatchedRays(ref RayPerceptionOutput.RayOutput[] batchedRaycastOutputs, RayPerceptionInput input)
+        {
+            var numRays = input.Angles.Count;
+            var results = new NativeArray<RaycastHit>(numRays, Allocator.TempJob);
+            var unscaledRayLength = input.RayLength;
+            var unscaledCastRadius = input.CastRadius;
+
+            var raycastCommands = new NativeArray<RaycastCommand>(unscaledCastRadius <= 0f ? numRays : 0, Allocator.TempJob);
+            var spherecastCommands = new NativeArray<SpherecastCommand>(unscaledCastRadius > 0f ? numRays : 0, Allocator.TempJob);
+
+            for (int i = 0; i < numRays; i++)
+            {
+                var extents = input.RayExtents(i);
+                var startPositionWorld = extents.StartPositionWorld;
+                var endPositionWorld = extents.EndPositionWorld;
+
+                var rayDirection = endPositionWorld - startPositionWorld;
+                var scaledRayLength = rayDirection.magnitude;
+                var scaledCastRadius = unscaledRayLength > 0 ?
+                    unscaledCastRadius * scaledRayLength / unscaledRayLength :
+                    unscaledCastRadius;
+
+                var queryParameters = QueryParameters.Default;
+                queryParameters.layerMask = input.LayerMask;
+
+                var rayDirectionNormalized = rayDirection.normalized;
+
+                if (scaledCastRadius > 0f)
+                {
+                    spherecastCommands[i] = new SpherecastCommand(startPositionWorld, scaledCastRadius, rayDirectionNormalized, queryParameters, scaledRayLength);
+                }
+                else
+                {
+                    raycastCommands[i] = new RaycastCommand(startPositionWorld, rayDirectionNormalized, queryParameters, scaledRayLength);
+                }
+
+                batchedRaycastOutputs[i] = new RayPerceptionOutput.RayOutput
+                {
+                    HitTagIndex = -1,
+                    StartPositionWorld = startPositionWorld,
+                    EndPositionWorld = endPositionWorld,
+                    ScaledCastRadius = scaledCastRadius
+                };
+            }
+
+            if (unscaledCastRadius > 0f)
+            {
+                JobHandle handle = SpherecastCommand.ScheduleBatch(spherecastCommands, results, 1, 1, default(JobHandle));
+                handle.Complete();
+            }
+            else
+            {
+                JobHandle handle = RaycastCommand.ScheduleBatch(raycastCommands, results, 1, 1, default(JobHandle));
+                handle.Complete();
+            }
+
+            for (int i = 0; i < results.Length; i++)
+            {
+                var castHit = results[i].collider != null;
+                var hitFraction = 1.0f;
+                GameObject hitObject = null;
+                float scaledRayLength;
+                float scaledCastRadius = batchedRaycastOutputs[i].ScaledCastRadius;
+                if (scaledCastRadius > 0f)
+                {
+                    scaledRayLength = spherecastCommands[i].distance;
+                }
+                else
+                {
+                    scaledRayLength = raycastCommands[i].distance;
+                }
+
+                hitFraction = castHit ? (scaledRayLength > 0 ? results[i].distance / scaledRayLength : 0.0f) : 1.0f;
+                hitObject = castHit ? results[i].collider.gameObject : null;
+
+                if (castHit && hitObject != null)
+                {
+                    var numTags = input.DetectableTags?.Count ?? 0;
+                    for (int j = 0; j < numTags; j++)
+                    {
+                        try
+                        {
+                            var tag = input.DetectableTags[j];
+                            if (!string.IsNullOrEmpty(tag) && hitObject.CompareTag(tag))
+                            {
+                                batchedRaycastOutputs[i].HitTagIndex = j;
+                                break;
+                            }
+                        }
+                        catch (UnityException)
+                        {
+                        }
+                    }
+                }
+
+                batchedRaycastOutputs[i].HasHit = castHit;
+                batchedRaycastOutputs[i].HitFraction = hitFraction;
+                batchedRaycastOutputs[i].HitGameObject = hitObject;
+            }
+
+            results.Dispose();
+            raycastCommands.Dispose();
+            spherecastCommands.Dispose();
+        }
+
+        /// <summary>
+        /// Evaluate the raycast results of a single ray from the RayPerceptionInput.
+        /// </summary>
+        /// <param name="input">Input</param>
+        /// <param name="rayIndex">Ray index</param>
+        /// <returns>`RayOutput` result of a single raycast.</returns>
+        internal static RayPerceptionOutput.RayOutput PerceiveSingleRay(
+            RayPerceptionInput input,
+            int rayIndex
+        )
+        {
+            var unscaledRayLength = input.RayLength;
+            var unscaledCastRadius = input.CastRadius;
+
+            var extents = input.RayExtents(rayIndex);
+            var startPositionWorld = extents.StartPositionWorld;
+            var endPositionWorld = extents.EndPositionWorld;
+
+            var rayDirection = endPositionWorld - startPositionWorld;
+            var scaledRayLength = rayDirection.magnitude;
+            var scaledCastRadius = unscaledRayLength > 0 ?
+                unscaledCastRadius * scaledRayLength / unscaledRayLength :
+                unscaledCastRadius;
+
+            var castHit = false;
+            var hitFraction = 1.0f;
+            GameObject hitObject = null;
+
+            if (input.CastType == RayPerceptionCastType.Cast3D)
+            {
+#if MLA_UNITY_PHYSICS_MODULE
+                RaycastHit rayHit;
+                if (scaledCastRadius > 0f)
+                {
+                    castHit = Physics.SphereCast(startPositionWorld, scaledCastRadius, rayDirection, out rayHit,
+                        scaledRayLength, input.LayerMask);
+                }
+                else
+                {
+                    castHit = Physics.Raycast(startPositionWorld, rayDirection, out rayHit,
+                        scaledRayLength, input.LayerMask);
+                }
+
+                hitFraction = castHit ? (scaledRayLength > 0 ? rayHit.distance / scaledRayLength : 0.0f) : 1.0f;
+                hitObject = castHit ? rayHit.collider.gameObject : null;
+#endif
+            }
+            else
+            {
+#if MLA_UNITY_PHYSICS2D_MODULE
+                RaycastHit2D rayHit;
+                if (scaledCastRadius > 0f)
+                {
+                    rayHit = Physics2D.CircleCast(startPositionWorld, scaledCastRadius, rayDirection,
+                        scaledRayLength, input.LayerMask);
+                }
+                else
+                {
+                    rayHit = Physics2D.Raycast(startPositionWorld, rayDirection, scaledRayLength, input.LayerMask);
+                }
+
+                castHit = rayHit;
+                hitFraction = castHit ? rayHit.fraction : 1.0f;
+                hitObject = castHit ? rayHit.collider.gameObject : null;
+#endif
+            }
+
+            var rayOutput = new RayPerceptionOutput.RayOutput
+            {
+                HasHit = castHit,
+                HitFraction = hitFraction,
+                HitTagIndex = -1,
+                HitGameObject = hitObject,
+                StartPositionWorld = startPositionWorld,
+                EndPositionWorld = endPositionWorld,
+                ScaledCastRadius = scaledCastRadius
+            };
+
+            if (castHit && hitObject != null)
+            {
+                int numTags = input.DetectableTags?.Count ?? 0;
+                for (int i = 0; i < numTags; i++)
+                {
+                    try
+                    {
+                        var tag = input.DetectableTags[i];
+                        if (!string.IsNullOrEmpty(tag) && hitObject.CompareTag(tag))
+                        {
+                            rayOutput.HitTagIndex = i;
+                            break;
+                        }
+                    }
+                    catch (UnityException)
+                    {
+                        // Ignore invalid tags
+                    }
+                }
+            }
+
+            return rayOutput;
         }
     }
 }
